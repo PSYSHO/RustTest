@@ -29,3 +29,25 @@
     КонецЦикла;
 
 КонецПроцедуры
+
+
+
+<?xml version="1.0" encoding="UTF-8"?>
+<component>
+    <name>NativeApiSearch</name>
+    <version>1.0.0</version>
+    <description>Компонента для полнотекстового поиска на базе Tantivy</description>
+    
+    <!-- Описание для разных ОС и архитектур -->
+    <platforms>
+        <!-- Windows x64 (MSVC) - твой текущий вариант -->
+        <platform os="Windows" arch="x86_64" compiler="msvc">
+            <file>nativeapi.dll</file>
+            <class>NativeApiSearch</class>
+            <!-- Имя класса в коде Rust (структура NativeApiSearch) -->
+        </platform>
+        
+        <!-- Если позже соберешь под Linux, сюда добавишь строки для Linux -->
+        <!-- <platform os="Linux" arch="x86_64">...</platform> -->
+    </platforms>
+</component>
