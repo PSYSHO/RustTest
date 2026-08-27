@@ -1,0 +1,15 @@
+[package]
+name = "nativelib"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "nativelib"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+native_api_1c = "0.10"
+utf16_lit = "2.0"
+tantivy = "0.26.1"
+serde_json = "1"
