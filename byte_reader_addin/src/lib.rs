@@ -73,7 +73,7 @@ impl SearchEngine {
         let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
             let mut schema_builder = Schema::builder();
             let id_field = schema_builder.add_text_field("id", STORED);
-            let text_field = schema_builder.add_text_field("text", TEXT);
+            let text_field = schema_builder.add_text_field("text",  TEXT | STORED);
             let schema = schema_builder.build();
 
             let index = Index::create_in_ram(schema);
@@ -129,7 +129,7 @@ pub struct NativeApiSearch {
 
     #[add_in_func(name = "Search", name_ru = "Поиск")]
     #[arg(Str)]
-    #[arg(Int)]
+    #[arg(Int, default = 100)]
     #[returns(Str, result)]
     pub search: fn(&Self, String, i32) -> Result<String, ()>,
 
