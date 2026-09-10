@@ -1,391 +1,619 @@
-use std::sync::{Arc, Mutex};
-use std::io::Write;
-use std::panic;
+Техническое описание (ТО) внешней компоненты NativeApiSearch для 1С:Предприятие
+1. Общее назначение
+Внешняя компонента (AddIn) NativeApiSearch реализует полнотекстовый поиск по коллекции документов внутри 1С:Предприятие. Компонента построена на базе Rust-библиотеки Tantivy — полнотекстового поискового движка, аналогичного Apache Lucene. Компонента подключается к 1С через native_api_1c и предоставляет набор методов и свойств, доступных из встроенного языка 1С.
 
-use native_api_1c::{
-    native_api_1c_core::ffi::connection::Connection,
-    native_api_1c_macro::{extern_functions, AddIn},
-};
+Область применения:
 
-use tantivy::{
-    collector::TopDocs,
-    doc,
-    query::QueryParser,
-    schema::{Field, Schema, STORED, TEXT},
-    Index,
-};
+Быстрый полнотекстовый поиск по большим коллекциям строк (справочники, документы, регистры).
 
-// ============================================
-// ЛОГГЕР (без chrono, используем std::time)
-// ============================================
-fn log_to_file(msg: &str) {
-    let _ = std::fs::create_dir_all("C:\\temp");
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("C:\\temp\\rust_component.log")
-    {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let _ = writeln!(file, "[{}] {}", now, msg);
-    }
-}
+Хранение индекса в оперативной памяти (RAM) без записи на диск.
 
-// ============================================
-// ДВИЖОК ПОИСКА
-// ============================================
-struct SearchEngine {
-    index: Option<Index>,
-    text_field: Option<Field>,
-    id_field: Option<Field>,
-    extra_field: Option<Field>,
-    total: usize,
-}
+Динамическое добавление и удаление документов без полной перестройки индекса.
 
-impl Default for SearchEngine {
-    fn default() -> Self {
-        Self {
-            index: None,
-            text_field: None,
-            id_field: None,
-            extra_field: None,
-            total: 0,
-        }
-    }
-}
+Ключевые особенности:
 
-impl SearchEngine {
-    fn search(&self, query: &str, limit: usize) -> Result<String, String> {
-        let result = (|| -> Result<String, Box<dyn std::error::Error>> {
-            let index = self
-                .index
-                .as_ref()
-                .ok_or("Индекс не построен")?;
-            let text_field = self.text_field.unwrap();
-            let id_field = self.id_field.unwrap();
-            let extra_field = self.extra_field.unwrap();
+Индекс создаётся в оперативной памяти (Index::create_in_ram), не требует файловой системы.
 
-            let reader = index.reader()?;
-            let searcher = reader.searcher();
+Схема документа фиксирована: два поля — id (GUID, хранимое) и text (строка, индексируемая).
 
-            let parser = QueryParser::for_index(index, vec![text_field]);
-            let q = parser.parse_query(query)?;
+Компонента потокобезопасна: доступ к движку защищён Arc<Mutex<SearchEngine>>.
 
-            let top = searcher.search(&q, &TopDocs::with_limit(limit.max(1)))?;
+Все ошибки внутри методов «проглатываются» и возвращаются в виде кодов/пустых значений, чтобы не выбрасывать панику в 1С.
 
-            let mut hits = Vec::new();
-            for (score, addr) in top {
-                let document = searcher.doc(addr)?;
-                
-                hits.push(serde_json::json!({
-                    "id": document.get_first(id_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
-                    "text": document.get_first(text_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
-                    "extra": document.get_first(extra_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
-                    "score": score,
-                }));
-            }
+2. Архитектура
+Компонента состоит из двух логических слоёв:
 
-            Ok(serde_json::to_string(&hits)?)
-        })();
+text
+┌─────────────────────────────────────────────────┐
+│              NativeApiSearch (AddIn)            │
+│  ┌───────────────────────────────────────────┐  │
+│  │ Публичные методы и свойства для 1С        │  │
+│  │  - CollectionJson (свойство)              │  │
+│  │  - HelloWorld()                           │  │
+│  │  - BuildIndex()                           │  │
+│  │  - Search(Запрос, Лимит)                  │  │
+│  │  - Add(Ид, Текст)                         │  │
+│  │  - Remove(Ид)                             │  │
+│  │  - Count()                                │  │
+│  └───────────────────────────────────────────┘  │
+│                      │                          │
+│                      ▼                          │
+│  ┌───────────────────────────────────────────┐  │
+│  │  Arc<Mutex<SearchEngine>>                 │  │
+│  │  ┌─────────────────────────────────────┐  │  │
+│  │  │ SearchEngine                        │  │  │
+│  │  │  - index: Option<Index>             │  │  │
+│  │  │  - id_field: Option<Field>          │  │  │
+│  │  │  - text_field: Option<Field>        │  │  │
+│  │  │  - total: usize                     │  │  │
+│  │  └─────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+                      │
+                      ▼
+              ┌───────────────┐
+              │   Tantivy     │
+              │  (in-RAM)     │
+              └───────────────┘
+Слой 1 — SearchEngine — «чистая» логика работы с Tantivy: построение индекса, поиск, добавление, удаление. Не зависит от 1С.
 
-        match result {
-            Ok(data) => Ok(data),
-            Err(e) => Err(format!("Ошибка: {}", e)),
-        }
-    }
+Слой 2 — NativeApiSearch — обёртка-AddIn: макрос #[derive(AddIn)] генерирует FFI-экспорты (GetClassObject, DestroyObject, Init, Done, DllMain), а также связывает публичные поля-функции с методами 1С.
 
-    fn build_index_from_docs(&mut self, docs: &[serde_json::Value]) -> Result<usize, String> {
-        let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
-            let mut schema_builder = Schema::builder();
-            let id_field = schema_builder.add_text_field("id", STORED);
-            let text_field = schema_builder.add_text_field("text", TEXT);
-            let extra_field = schema_builder.add_text_field("extra", STORED);
-            let schema = schema_builder.build();
+3. Схема индекса
+Индекс Tantivy имеет фиксированную схему из двух полей:
 
-            let index = Index::create_in_ram(schema);
-            let mut writer = index.writer(50_000_000)?;
+Поле	Тип в Tantivy	Флаги	Назначение
+id	text	STORED	GUID документа. Хранится, но не индексируется (поиск по нему невозможен, но используется для удаления).
+text	text	TEXT	Основной текст. Индексируется с токенизацией, доступен полнотекстовый поиск.
+Пояснения:
 
-            for d in docs {
-                let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let text = d.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let extra = d.get("extra").and_then(|v| v.as_str()).unwrap_or("");
-                writer.add_document(doc!(
-                    id_field => id.to_string(),
-                    text_field => text.to_string(),
-                    extra_field => extra.to_string()
-                ))?;
-            }
+STORED — значение сохраняется в индексе и возвращается при поиске.
 
-            writer.commit()?;
-            drop(writer);
+TEXT — поле токенизируется (разбивается на слова), индексируется, но не хранится в исходном виде; для его возврата при поиске используется STORED-версия. В данной схеме TEXT включает STORED по умолчанию в новых версиях Tantivy, но для гарантии корректного возврата текста в Search можно при необходимости заменить на TEXT | STORED.
 
-            self.index = Some(index);
-            self.text_field = Some(text_field);
-            self.id_field = Some(id_field);
-            self.extra_field = Some(extra_field);
-            self.total = docs.len();
+4. Публичный интерфейс для 1С
+4.1. Свойство CollectionJson / КоллекцияJSON
+Параметр	Значение
+Тип	Str (строка)
+Чтение	Да
+Запись	Да
+Имя (EN)	CollectionJson
+Имя (RU)	КоллекцияJSON
+Назначение: входной JSON-массив документов для первичного построения индекса методом BuildIndex.
 
-            Ok(docs.len())
-        })();
+Формат:
 
-        match result {
-            Ok(count) => Ok(count),
-            Err(e) => Err(format!("Ошибка: {}", e)),
-        }
-    }
-}
+json
+[
+  { "id": "0f8fad5b-d9cb-469f-a165-70867728950e", "text": "Первый документ" },
+  { "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7", "text": "Второй документ" }
+]
+Правила:
 
-// ============================================
-// КОМПОНЕНТА 1С С ЗАЩИТОЙ ОТ ПАНИКИ
-// ============================================
-#[derive(AddIn)]
-pub struct NativeApiSearch {
-    #[add_in_con]
-    connection: Arc<Option<&'static Connection>>,
+Оба поля (id, text) необязательны: при отсутствии подставляется пустая строка.
 
-    #[add_in_prop(ty = Str, name = "CollectionJson", name_ru = "КоллекцияJSON", readable, writable)]
-    pub collection_json: String,
+Дополнительные поля игнорируются.
 
-    engine: Arc<Mutex<SearchEngine>>,
+Если JSON невалиден, BuildIndex вернёт -1.
 
-    #[add_in_func(name = "HelloWorld", name_ru = "ПриветМир")]
-    #[returns(ty = Str, result)]
-    pub hello_world: fn(&Self) -> Result<String, ()>,
+4.2. Метод HelloWorld / ПриветМир
+Параметр	Значение
+Аргументы	нет
+Возврат	Str
+Имя (EN)	HelloWorld
+Имя (RU)	ПриветМир
+Назначение: диагностический метод для проверки работоспособности компоненты.
 
-    #[add_in_func(name = "BuildIndex", name_ru = "ПостроитьИндекс")]
-    #[returns(ty = Int, result)]
-    pub build_index: fn(&mut Self) -> Result<i32, ()>,
+Возвращает: строку "Hello World from Rust!".
 
-    #[add_in_func(name = "Search", name_ru = "Поиск")]
-    #[arg(ty = Str)]
-    #[arg(ty = Int)]
-    #[returns(ty = Str, result)]
-    pub search: fn(&Self, String, i32) -> Result<String, ()>,
+Пример на 1С:
 
-    #[add_in_func(name = "Add", name_ru = "Добавить")]
-    #[arg(ty = Str)]
-    #[arg(ty = Str)]
-    #[arg(ty = Str)]
-    #[returns(ty = Int, result)]
-    pub add: fn(&mut Self, String, String, String) -> Result<i32, ()>,
+bsl
+Компонента = Новый("AddIn.NativeApiSearch");
+Сообщить(Компонента.HelloWorld()); // Hello World from Rust!
+4.3. Метод BuildIndex / ПостроитьИндекс
+Параметр	Значение
+Аргументы	нет
+Возврат	Int
+Имя (EN)	BuildIndex
+Имя (RU)	ПостроитьИндекс
+Назначение: полностью пересоздать индекс в оперативной памяти на основе JSON, записанного в свойство CollectionJson.
 
-    #[add_in_func(name = "Remove", name_ru = "Удалить")]
-    #[arg(ty = Str)]
-    #[returns(ty = Int, result)]
-    pub remove: fn(&mut Self, String) -> Result<i32, ()>,
+Возвращаемые значения:
 
-    #[add_in_func(name = "Count", name_ru = "Количество")]
-    #[returns(ty = Int, result)]
-    pub count: fn(&Self) -> Result<i32, ()>,
-}
+Код	Описание
+>= 0	Количество успешно добавленных документов.
+-1	Ошибка разбора JSON из CollectionJson.
+-2	Ошибка захвата мьютекса движка (крайне маловероятно).
+-3	Ошибка Tantivy (создание индекса, writer, добавление, commit).
+Побочные эффекты:
 
-impl Default for NativeApiSearch {
-    fn default() -> Self {
-        Self {
-            connection: Arc::new(None),
-            collection_json: String::new(),
-            engine: Arc::new(Mutex::new(SearchEngine::default())),
-            hello_world: Self::hello_world_inner,
-            build_index: Self::build_index_inner,
-            search: Self::search_inner,
-            add: Self::add_inner,
-            remove: Self::remove_inner,
-            count: Self::count_inner,
-        }
-    }
-}
+Предыдущий индекс полностью уничтожается.
 
-impl NativeApiSearch {
-    fn hello_world_inner(&self) -> Result<String, ()> {
-        log_to_file("HelloWorld вызван");
-        Ok("Hello from Rust!".to_string())
-    }
+Сбрасываются поля id_field, text_field.
 
-    fn build_index_inner(&mut self) -> Result<i32, ()> {
-        log_to_file("BuildIndex вызван");
-        
-        let result = panic::catch_unwind(|| {
-            let docs: Vec<serde_json::Value> = match serde_json::from_str(&self.collection_json) {
-                Ok(d) => d,
-                Err(_) => return Ok(-1),
-            };
+Счётчик total устанавливается равным числу документов.
 
-            let mut engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => return Ok(-2),
-            };
+Пример на 1С:
 
-            match engine.build_index_from_docs(&docs) {
-                Ok(count) => Ok(count as i32),
-                Err(_) => Ok(-3),
-            }
-        });
-        
-        match result {
-            Ok(val) => val,
-            Err(e) => {
-                log_to_file(&format!("ПАНИКА в BuildIndex: {:?}", e));
-                Ok(-4)
-            }
-        }
-    }
+bsl
+Компонента.КоллекцияJSON = "[
+  |  {""id"":""11111111-1111-1111-1111-111111111111"",""text"":""Молоко""},
+  |  {""id"":""22222222-2222-2222-2222-222222222222"",""text"":""Хлеб""}
+  |]";
+Количество = Компонента.ПостроитьИндекс();
+Сообщить("Проиндексировано: " + Количество);
+4.4. Метод Search / Поиск
+Параметр	Значение
+Аргумент 1	Str — поисковый запрос
+Аргумент 2	Int — лимит результатов
+Возврат	Str — JSON-массив найденных документов
+Имя (EN)	Search
+Имя (RU)	Поиск
+Назначение: выполнить полнотекстовый поиск по полю text.
 
-    fn search_inner(&self, query: String, limit: i32) -> Result<String, ()> {
-        log_to_file(&format!("Search вызван: query='{}', limit={}", query, limit));
-        
-        let result = panic::catch_unwind(|| {
-            if query.trim().is_empty() {
-                return Ok("[]".to_string());
-            }
+Правила:
 
-            let safe_limit = if limit > 10 { 10 } else { limit };
-            if safe_limit <= 0 {
-                return Ok("[]".to_string());
-            }
+Синтаксис запроса — стандартный для Tantivy QueryParser: слово, "фраза", слово1 AND слово2, слово1 OR слово2, слово* (префикс), -слово (исключение).
 
-            let engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => return Ok("[]".to_string()),
-            };
+Если limit > 10, значение принудительно снижается до 10.
 
-            match engine.search(&query, safe_limit as usize) {
-                Ok(result) => Ok(result),
-                Err(_) => Ok("[]".to_string()),
-            }
-        });
-        
-        match result {
-            Ok(val) => val,
-            Err(e) => {
-                log_to_file(&format!("ПАНИКА в Search: {:?}", e));
-                Ok("[]".to_string())
-            }
-        }
-    }
+Если limit <= 0, возвращается пустой массив [].
 
-    fn add_inner(&mut self, id: String, text: String, extra: String) -> Result<i32, ()> {
-        log_to_file(&format!("Add вызван: id='{}'", id));
-        
-        let result = panic::catch_unwind(|| {
-            let mut engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => return Ok(0),
-            };
+Если запрос пуст или состоит из пробелов, возвращается [].
 
-            let index = match engine.index.as_ref() {
-                Some(i) => i,
-                None => return Ok(0),
-            };
-            let id_field = match engine.id_field {
-                Some(f) => f,
-                None => return Ok(0),
-            };
-            let text_field = match engine.text_field {
-                Some(f) => f,
-                None => return Ok(0),
-            };
-            let extra_field = match engine.extra_field {
-                Some(f) => f,
-                None => return Ok(0),
-            };
+Если индекс не построен, возвращается [].
 
-            let mut writer = match index.writer(50_000_000) {
-                Ok(w) => w,
-                Err(_) => return Ok(0),
-            };
+Любая внутренняя ошибка приводит к возврату [].
 
-            if let Err(_) = writer.add_document(doc!(
-                id_field => id,
-                text_field => text,
-                extra_field => extra
-            )) {
-                return Ok(0);
-            }
+Формат ответа:
 
-            if let Err(_) = writer.commit() {
-                return Ok(0);
-            }
-            drop(writer);
+json
+[
+  { "id": "11111111-1111-1111-1111-111111111111", "text": "Молоко", "score": 0.2876821 },
+  { "id": "22222222-2222-2222-2222-222222222222", "text": "Хлеб",   "score": 0.2231435 }
+]
+Поле	Описание
+id	GUID документа.
+text	Текст документа.
+score	Релевантность (чем больше — тем лучше).
+Пример на 1С:
 
-            engine.total += 1;
-            Ok(1)
-        });
-        
-        match result {
-            Ok(val) => val,
-            Err(e) => {
-                log_to_file(&format!("ПАНИКА в Add: {:?}", e));
-                Ok(0)
-            }
-        }
-    }
+bsl
+Результат = Компонента.Поиск("Молоко", 10);
+Массив = Новый ЧтениеJSON;
+Массив.УстановитьСтроку(Результат);
+Данные = ПрочитатьJSON(Массив);
+Для Каждого Стр Из Данные Цикл
+    Сообщить(Стр.id + " → " + Стр.text + " (score=" + Стр.score + ")");
+КонецЦикла;
+4.5. Метод Add / Добавить
+Параметр	Значение
+Аргумент 1	Str — идентификатор (GUID)
+Аргумент 2	Str — текст документа
+Возврат	Int
+Имя (EN)	Add
+Имя (RU)	Добавить
+Назначение: добавить один документ в существующий индекс.
 
-    fn remove_inner(&mut self, id: String) -> Result<i32, ()> {
-        log_to_file(&format!("Remove вызван: id='{}'", id));
-        
-        let result = panic::catch_unwind(|| {
-            let mut engine = match self.engine.lock() {
-                Ok(e) => e,
-                Err(_) => return Ok(0),
-            };
+Возвращаемые значения:
 
-            let index = match engine.index.as_ref() {
-                Some(i) => i,
-                None => return Ok(0),
-            };
-            let id_field = match engine.id_field {
-                Some(f) => f,
-                None => return Ok(0),
-            };
+Код	Описание
+1	Документ успешно добавлен.
+0	Индекс не построен, либо ошибка Tantivy (writer, добавление, commit).
+Побочные эффекты:
 
-            let mut writer = match index.writer(50_000_000) {
-                Ok(w) => w,
-                Err(_) => return Ok(0),
-            };
+При успехе total увеличивается на 1.
 
-            let term = tantivy::Term::from_field_text(id_field, &id);
-            writer.delete_term(term);
-            if let Err(_) = writer.commit() {
-                return Ok(0);
-            }
-            drop(writer);
+Индекс не перестраивается — документ дописывается инкрементально.
 
-            engine.total = engine.total.saturating_sub(1);
-            Ok(1)
-        });
-        
-        match result {
-            Ok(val) => val,
-            Err(e) => {
-                log_to_file(&format!("ПАНИКА в Remove: {:?}", e));
-                Ok(0)
-            }
-        }
-    }
+Дубликаты по id не проверяются (если нужно — используйте Remove перед Add).
 
-    fn count_inner(&self) -> Result<i32, ()> {
-        let result = panic::catch_unwind(|| {
-            match self.engine.lock() {
-                Ok(engine) => Ok(engine.total as i32),
-                Err(_) => Ok(0),
-            }
-        });
-        
-        match result {
-            Ok(val) => val,
-            Err(e) => {
-                log_to_file(&format!("ПАНИКА в Count: {:?}", e));
-                Ok(0)
-            }
-        }
-    }
-}
+Пример на 1С:
 
-// ============================================
-// ЭКСПОРТ ФУНКЦИЙ
-// ============================================
-extern_functions! {
-    NativeApiSearch::default(),
-}
+bsl
+Компонента.Добавить("33333333-3333-3333-3333-333333333333", "Сыр");
+4.6. Метод Remove / Удалить
+Параметр	Значение
+Аргумент 1	Str — идентификатор (GUID)
+Возврат	Int
+Имя (EN)	Remove
+Имя (RU)	Удалить
+Назначение: удалить документ по id из индекса.
+
+Возвращаемые значения:
+
+Код	Описание
+1	Операция удаления выполнена (commit прошёл).
+0	Индекс не построен, либо ошибка Tantivy.
+Особенности:
+
+Удаление выполняется через delete_term по полю id — Tantivy помечает документ как удалённый; физически он исчезнет при следующем merge.
+
+Если документа с таким id не было — Tantivy всё равно вернёт успех (это не ошибка).
+
+total уменьшается на 1 (не ниже нуля) независимо от того, был ли документ.
+
+Двойное удаление одного и того же id приведёт к неверному счётчику total.
+
+Пример на 1С:
+
+bsl
+Компонента.Удалить("33333333-3333-3333-3333-333333333333");
+4.7. Метод Count / Количество
+Параметр	Значение
+Аргументы	нет
+Возврат	Int
+Имя (EN)	Count
+Имя (RU)	Количество
+Назначение: вернуть текущее количество документов в индексе по внутреннему счётчику total.
+
+Возвращаемые значения:
+
+Код	Описание
+>= 0	Текущее значение total.
+0	Если мьютекс не захвачен (крайне маловероятно).
+Важно: значение total — это внутренний счётчик компоненты, а не реальное число документов в Tantivy. Он увеличивается при BuildIndex и Add, уменьшается при Remove. При удалении несуществующего id счётчик всё равно уменьшается — это может привести к расхождению с фактическим числом документов в индексе.
+
+Пример на 1С:
+
+bsl
+Сообщить("Документов в индексе: " + Компонента.Количество());
+5. Сценарии использования
+5.1. Первичная загрузка и поиск
+bsl
+Компонента = Новый("AddIn.NativeApiSearch");
+
+// 1. Формируем JSON
+Массив = Новый Массив;
+Для Каждого СтрокаСпр Из Справочники.Товары Цикл
+    Массив.Добавить(Новый Структура("id, text",
+        Строка(СтрокаСпр.Ссылка.УникальныйИдентификатор()),
+        СтрокаСпр.Наименование));
+КонецЦикла;
+
+ЗаписьJSON = Новый ЗаписьJSON;
+ЗаписьJSON.УстановитьСтроку();
+ЗаписатьJSON(ЗаписьJSON, Массив);
+Компонента.КоллекцияJSON = ЗаписьJSON.Закрыть();
+
+// 2. Строим индекс
+Кол = Компонента.ПостроитьИндекс();
+Сообщить("Проиндексировано: " + Кол);
+
+// 3. Ищем
+Результат = Компонента.Поиск("молоко", 10);
+5.2. Инкрементальное обновление
+bsl
+// Добавление
+Компонента.Добавить(Строка(НовыйТовар.Ссылка.УникальныйИдентификатор()),
+                    НовыйТовар.Наименование);
+
+// Удаление
+Компонента.Удалить(Строка(УдалённыйТовар.Ссылка.УникальныйИдентификатор()));
+
+// Текущее количество
+Сообщить(Компонента.Количество());
+6. Обработка ошибок
+Компонента придерживается «тихой» стратегии обработки ошибок: паники и исключения Rust не пробрасываются в 1С. Вместо этого методы возвращают специальные значения:
+
+Метод	Признак ошибки
+BuildIndex	Отрицательное число (-1, -2, -3).
+Search	Пустая строка [].
+Add	0.
+Remove	0.
+Count	0.
+Рекомендация: в коде 1С проверять возвращаемые значения и вести журнал регистрации для диагностики.
+
+7. Потокобезопасность
+Движок обёрнут в Arc<Mutex<SearchEngine>>, что позволяет безопасно разделять его между вызовами.
+
+Методы BuildIndex, Search, Add, Remove, Count захватывают мьютекс на время работы.
+
+Метод HelloWorld не обращается к движку и не блокируется.
+
+При конкурентных вызовах из разных потоков 1С (что маловероятно, но возможно) вызовы сериализуются мьютексом.
+
+Ограничение: Tantivy IndexWriter не является Sync для одновременной записи; в данной реализации writer создаётся заново при каждом Add/Remove, что снимает проблему, но создаёт накладные расходы.
+
+8. Ограничения и известные особенности
+Индекс только в RAM. При перезапуске сеанса/компоненты индекс теряется — нужно пересоздавать через BuildIndex.
+
+Лимит поиска — 10. Жёстко задан в search_inner; больше 10 результатов за один вызов получить нельзя.
+
+Счётчик total не является истиной. Он не синхронизирован с реальным состоянием индекса Tantivy (удаления, повторные добавления).
+
+id не индексируется. Поиск по id через Search невозможен — только через Remove.
+
+Нет проверки дубликатов id. Add позволяет добавить несколько документов с одинаковым id.
+
+Нет сохранения индекса на диск. Каждый запуск — построение с нуля.
+
+text в схеме — только TEXT, без STORED. В зависимости от версии Tantivy это может привести к тому, что поле text не вернётся в результатах поиска. Если это критично — заменить на TEXT | STORED.
+
+Отсутствует Drop/Done с очисткой. Индекс освобождается вместе с компонентой.
+
+9. Сборка и подключение
+Зависимости Cargo.toml (ориентировочно):
+
+toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+native-api-1c = "..."
+native-api-1c-core = "..."
+native-api-1c-macro = "..."
+tantivy = "0.22"
+serde_json = "1"
+Сборка:
+
+bash
+cargo build --release
+Подключение в 1С:
+
+Положить .dll в каталог.
+
+ПодключитьВнешнююКомпоненту("Путь\К\NativeApiSearch.dll", "AddIn.NativeApiSearch", ТипВнешнейКомпоненты.Native);
+
+Компонента = Новый("AddIn.NativeApiSearch");
+
+10. Сводная таблица методов
+Метод (EN)	Метод (RU)	Аргументы	Возврат	Назначение
+HelloWorld	ПриветМир	—	Str	Проверка работоспособности
+BuildIndex	ПостроитьИндекс	—	Int	Полная перестройка индекса
+Search	Поиск	Str (запрос), Int (лимит)	Str	Полнотекстовый поиск
+Add	Добавить	Str (id), Str (text)	Int	Добавить документ
+Remove	Удалить	Str (id)	Int	Удалить документ по id
+Count	Количество	—	Int	Текущее число документов
+Свойство (EN)	Свойство (RU)	Тип	Чтение	Запись	Назначение
+CollectionJson	КоллекцияJSON	Str	Да	Да	Входной JSON для BuildIndex
+11. Рекомендации по доработке
+Добавить STORED к полю text (TEXT | STORED) для гарантированного возврата текста в результатах поиска.
+
+Вынести лимит поиска в свойство (например, MaxSearchResults) вместо жёсткого 10.
+
+Синхронизировать total с реальным состоянием — использовать searcher.num_docs() вместо ручного счётчика.
+
+Проверять существование id перед Add/Remove для избежания дубликатов и некорректного счётчика.
+
+Добавить метод Rebuild без сброса, либо метод Update(id, text) для замены документа.
+
+Добавить сохранение индекса на диск (Index::create_in_dir) для persistence между сеансами.
+
+Логировать ошибки через OutputDebugString или возвращать коды с детализацией (например, отдельный метод LastError).
+
+Добавить валидацию GUID в 1С-обёртке перед вызовом Add/Remove.
+
+12. Глоссарий
+Термин	Значение
+AddIn	Внешняя компонента 1С, подключаемая через native_api_1c.
+Tantivy	Полнотекстовый поисковый движок на Rust, аналог Lucene.
+Schema	Описание полей индекса (имя, тип, флаги).
+Field	Дескриптор поля в схеме.
+STORED	Флаг: значение сохраняется в индексе и возвращается при поиске.
+TEXT	Флаг: поле токенизируется и индексируется для полнотекстового поиска.
+IndexWriter	Объект Tantivy для записи/удаления документов и commit.
+Searcher	Объект Tantivy для выполнения поиска.
+TopDocs	Коллектор, возвращающий top-N результатов с оценками релевантности.
+QueryParser	Парсер поисковых запросов (поддерживает AND, OR, фразы, префиксы).
+Term	Терм — пара (поле, значение), используется для удаления.
+RAM-индекс	Индекс, полностью размещённый в оперативной памяти.
+Mutex	Примитив синхронизации Rust для защиты разделяемых данных.
+Arc	Атомарный счётчик ссылок Rust для разделения владения между потоками.
+добавь сборку она осуществляется как указанно тут https://infostart.ru/1c/articles/1920565/
+Найдено 15 веб-страниц
+Раздел 13. Сборка компоненты
+Сборка компоненты NativeApiSearch выполняется по методике, описанной в статье на Инфостарт «Внешние компоненты Native API на языке Rust — Просто!» . Весь процесс сводится к нескольким шагам: подготовка окружения, настройка Cargo.toml, установка зависимостей и компиляция в динамическую библиотеку (DLL).
+
+13.1. Подготовка окружения
+Для сборки необходимы следующие инструменты :
+
+Инструмент	Назначение	Ссылка
+Rust (rustup)	Компилятор и менеджер пакетов Cargo	https://www.rust-lang.org/tools/install
+Компилятор MSVC или GCC	Системный линкер для сборки DLL	—
+Редактор кода	VS Code с расширением rust-analyzer (или RustRover)	—
+13.1.1. Установка Rust
+Скачайте и запустите установщик rustup-init.exe со страницы https://www.rust-lang.org/tools/install .
+
+При установке на Windows возможны два варианта:
+
+Вариант А — с MSVC (рекомендуется для Windows):
+
+Нажмите 1 (default installation).
+
+Установщик сам скачает и настроит toolchain stable-x86_64-pc-windows-msvc.
+
+Для этого должна быть установлена Visual Studio Community с компонентом «Desktop development with C++» .
+
+Вариант Б — с GCC (MinGW):
+
+Введите 2 (customize installation).
+
+В качестве host triple укажите x86_64-pc-windows-gnu .
+
+Убедитесь, что GCC (MinGW-w64) установлен и доступен в PATH.
+
+13.1.2. Установка нужных toolchain'ов
+После установки rustup добавьте целевые платформы :
+
+bash
+# Для MSVC
+rustup toolchain install stable-x86_64-pc-windows-msvc
+rustup toolchain install stable-i686-pc-windows-msvc
+
+# Для GCC (альтернатива)
+rustup toolchain install stable-x86_64-pc-windows-gnu
+rustup toolchain install stable-i686-pc-windows-gnu
+13.1.3. Проверка установки
+bash
+rustc --version
+cargo --version
+rustup toolchain list
+Все три команды должны вывести версии без ошибок .
+
+13.2. Настройка Cargo.toml
+В корне проекта создайте/отредактируйте файл Cargo.toml. Ключевой момент — указание crate-type = ["cdylib"], чтобы результатом компиляции стала динамическая библиотека, пригодная для подключения в 1С .
+
+toml
+[package]
+name = "native_api_search"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+native_api_1c = "0.10.5"
+native_api_1c_core = "0.10.5"
+native_api_1c_macro = "0.10.5"
+tantivy = "0.22"
+serde_json = "1"
+Пояснения:
+
+native_api_1c — основная библиотека для Native API компонент .
+
+tantivy — полнотекстовый поисковый движок.
+
+serde_json — для разбора CollectionJson и сериализации результатов поиска.
+
+13.3. Установка зависимостей
+Из корня проекта выполните :
+
+bash
+cargo add native_api_1c utf16_lit
+cargo add tantivy serde_json
+Либо просто вручную добавьте зависимости в Cargo.toml (см. раздел 13.2) и выполните cargo build — Cargo сам скачает все крейты.
+
+13.4. Структура проекта
+Рекомендуемая структура :
+
+text
+native_api_search/
+├── Cargo.toml
+├── src/
+│   └── lib.rs          ← весь код компоненты
+└── target/             ← создаётся автоматически
+    └── x86_64-pc-windows-gnu/
+        └── debug/
+            └── native_api_search.dll
+Важно: имя проекта в Cargo.toml (name = "native_api_search") определит имя итогового файла DLL.
+
+13.5. Команды сборки
+13.5.1. Debug-сборка (для разработки)
+bash
+cargo build --target=x86_64-pc-windows-gnu
+Готовая компонента появится здесь :
+
+text
+target\x86_64-pc-windows-gnu\debug\native_api_search.dll
+13.5.2. Release-сборка (для продакшена)
+bash
+cargo build --release --target=x86_64-pc-windows-gnu
+Результат:
+
+text
+target\x86_64-pc-windows-gnu\release\native_api_search.dll
+Release-сборка оптимизирована по скорости и размеру, рекомендуется именно её использовать в 1С.
+
+13.5.3. Сборка под MSVC (если выбран этот toolchain)
+bash
+cargo build --release --target=x86_64-pc-windows-msvc
+13.5.4. Сборка под 32-битный клиент 1С (учебная версия)
+Если вы используете 32-битную учебную версию 1С, соберите под i686 :
+
+bash
+cargo build --release --target=i686-pc-windows-gnu
+13.6. Альтернативный способ: сборка через Docker
+Если вы не хотите устанавливать Rust локально, можно собрать компоненту в Linux-контейнере с кросс-компиляцией под Windows . Пример скрипта:
+
+bash
+docker run --rm -v "$PWD":/work -w /work \
+    rust:latest \
+    bash -c "rustup target add x86_64-pc-windows-gnu && \
+             apt-get update && apt-get install -y gcc-mingw-w64-x86-64 && \
+             cargo build --release --target=x86_64-pc-windows-gnu"
+Этот способ удобен для CI/CD и не требует установки Rust/MSVC на рабочую машину .
+
+13.7. Использование сгенерированного кода через конструктор
+Если вы используете Конструктор внешних компонент 1C (native API) , процесс отличается:
+
+В конструкторе на закладке «Функции» опишите методы (HelloWorld, BuildIndex, Search, Add, Remove, Count) с русскими и английскими именами.
+
+На закладке «Сборка» нажмите кнопку «Собрать» — конструктор сгенерирует:
+
+Проект на C++ (с CMakeLists.txt);
+
+Проект на Rust (со скелетом крейта).
+
+Сначала соберите Rust :
+
+bash
+cd rust
+cargo build
+Появится статическая библиотека (.lib/.a).
+
+Затем соберите C++ в Visual Studio:
+
+Откройте CMakeLists.txt через «Open Folder» в VS;
+
+Соберите проект — получите финальную DLL;
+
+Статическая библиотека Rust линкуется автоматически через CMake .
+
+Этот способ удобен, когда нужно автоматически генерировать обвязку для десятков методов, но для нашего случая (6 методов) проще собирать напрямую через cargo build, как в разделе 13.5.
+
+13.8. Упаковка в ZIP с манифестом (для кроссплатформенной загрузки)
+Если компонента должна автоматически подгружаться через ПодключитьВнешнююКомпоненту("ОбщийМакет.МояКомпонента"), упакуйте DLL в ZIP вместе с manifest.xml :
+
+xml
+<?xml version="1.0" encoding="UTF-8"?>
+<bundle xmlns="http://v8.1c.ru/8.2/addin/bundle">
+    <component os="Windows" path="native_api_search.dll" type="native" arch="x86_64"/>
+    <component os="Windows" path="native_api_search32.dll" type="native" arch="i386"/>
+    <component os="Linux" path="libnative_api_search.so" type="native" arch="x86_64"/>
+</bundle>
+Затем:
+
+Создайте ZIP-архив с manifest.xml и DLL;
+
+Загрузите архив как общий макет (например, ОбщийМакет.КомпонентаПоиска) в конфигурацию;
+
+Подключайте в BSL-коде:
+
+bsl
+Если Не ПодключитьВнешнююКомпоненту("ОбщийМакет.КомпонентаПоиска", 
+        "NativeApiSearch", ТипВнешнейКомпоненты.Native) Тогда
+    ВызватьИсключение "Не удалось загрузить компоненту";
+КонецЕсли;
+
+Компонента = Новый("AddIn.NativeApiSearch.NativeApiSearch");
+13.9. Подключение собранной DLL в 1С
+Способ 1 — по пути к файлу:
+
+bsl
+ПутьККомпоненте = "C:\Components\native_api_search.dll";
+Если Не ПодключитьВнешнююКомпоненту(ПутьККомпоненте, "NativeApiSearch",
+        ТипВнешнейКомпоненты.Native) Тогда
+    ВызватьИсключение "Ошибка подключения: " + ПутьККомпоненте;
+КонецЕсли;
+
+Компонента = Новый("AddIn.NativeApiSearch.NativeApiSearch");
+Сообщить(Компонента.HelloWorld());
+Способ 2 — через макет в конфигурации (см. раздел 13.8):
+
+bsl
+Если Не ПодключитьВнешнююКомпоненту("ОбщийМакет.КомпонентаПоиска",
+        "NativeApiSearch", ТипВнешнейКомпоненты.Native) Тогда
+    ВызватьИсключение "Не удалось подключить";
+КонецЕсли;
+Полное имя объекта для Новый() формируется как "AddIn.<ИмяПодключения>.<ИмяСтруктуры>", где <ИмяСтруктуры> — имя структуры из #[derive(AddIn)] (в нашем случае NativeApiSearch) .
+
+13.10. Возможные проблемы при сборке
+Проблема	Решение
+error: linker 'link.exe' not found	Не установлен MSVC. Установите Visual Studio Build Tools с компонентом «C++ build tools» .
+error: could not find 'cargo'	Rust не добавлен в PATH. Перезапустите терминал или выполните source $HOME/.cargo/env .
+Не найдена DLL после сборки	Проверьте папку target/<target-triple>/release/, а не target/release/, если указывали --target .
+1С не видит компоненту	Убедитесь, что DLL собрана под ту же разрядность, что и клиент 1С (x86 vs x64). Для учебной версии — i686 .
+Ошибка зависимостей Tantivy	Tantivy требует свежий Rust (≥1.70). Обновите через rustup update .

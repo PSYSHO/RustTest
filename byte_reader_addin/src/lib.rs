@@ -1,0 +1,294 @@
+use std::sync::{Arc, Mutex};
+
+use native_api_1c::{
+    native_api_1c_core::ffi::connection::Connection,
+    native_api_1c_macro::AddIn,
+};
+
+use tantivy::{
+    collector::TopDocs,
+    doc,
+    query::QueryParser,
+    schema::{Field, Schema, STORED, TEXT},
+    Index,
+};
+
+// ============================================
+// ДВИЖОК ПОИСКА
+// ============================================
+struct SearchEngine {
+    index: Option<Index>,
+    text_field: Option<Field>,
+    id_field: Option<Field>,
+    total: usize,
+}
+
+impl Default for SearchEngine {
+    fn default() -> Self {
+        Self {
+            index: None,
+            text_field: None,
+            id_field: None,
+            total: 0,
+        }
+    }
+}
+
+impl SearchEngine {
+    fn search(&self, query: &str, limit: usize) -> Result<String, String> {
+        let result = (|| -> Result<String, Box<dyn std::error::Error>> {
+            let index = self.index.as_ref().ok_or("Индекс не построен")?;
+            let text_field = self.text_field.unwrap();
+            let id_field = self.id_field.unwrap();
+
+            let reader = index.reader()?;
+            let searcher = reader.searcher();
+
+            let parser = QueryParser::for_index(index, vec![text_field]);
+            let q = parser.parse_query(query)?;
+
+            let top = searcher.search(&q, &TopDocs::with_limit(limit.max(1)))?;
+
+            let mut hits = Vec::new();
+            for (score, addr) in top {
+                let document = searcher.doc(addr)?;
+
+                hits.push(serde_json::json!({
+                    "id": document.get_first(id_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
+                    "text": document.get_first(text_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
+                    "score": score,
+                }));
+            }
+
+            Ok(serde_json::to_string(&hits)?)
+        })();
+
+        match result {
+            Ok(data) => Ok(data),
+            Err(e) => Err(format!("Ошибка: {}", e)),
+        }
+    }
+
+    fn build_index_from_docs(&mut self, docs: &[serde_json::Value]) -> Result<usize, String> {
+        let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
+            let mut schema_builder = Schema::builder();
+            let id_field = schema_builder.add_text_field("id", STORED);
+            let text_field = schema_builder.add_text_field("text", TEXT);
+            let schema = schema_builder.build();
+
+            let index = Index::create_in_ram(schema);
+            let mut writer = index.writer(50_000_000)?;
+
+            for d in docs {
+                let id = d.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let text = d.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                writer.add_document(doc!(
+                    id_field => id.to_string(),
+                    text_field => text.to_string()
+                ))?;
+            }
+
+            writer.commit()?;
+            drop(writer);
+
+            self.index = Some(index);
+            self.text_field = Some(text_field);
+            self.id_field = Some(id_field);
+            self.total = docs.len();
+
+            Ok(docs.len())
+        })();
+
+        match result {
+            Ok(count) => Ok(count),
+            Err(e) => Err(format!("Ошибка: {}", e)),
+        }
+    }
+}
+
+// ============================================
+// КОМПОНЕНТА 1С
+// ============================================
+#[derive(AddIn)]
+pub struct NativeApiSearch {
+    #[add_in_con]
+    connection: Arc<Option<&'static Connection>>,
+
+    #[add_in_prop(ty = Str, name = "CollectionJson", name_ru = "КоллекцияJSON", readable, writable)]
+    pub collection_json: String,
+
+    engine: Arc<Mutex<SearchEngine>>,
+
+    #[add_in_func(name = "HelloWorld", name_ru = "ПриветМир")]
+    #[returns(Str, result)]
+    pub hello_world: fn(&Self) -> Result<String, ()>,
+
+    #[add_in_func(name = "BuildIndex", name_ru = "ПостроитьИндекс")]
+    #[returns(Int, result)]
+    pub build_index: fn(&mut Self) -> Result<i32, ()>,
+
+    #[add_in_func(name = "Search", name_ru = "Поиск")]
+    #[arg(Str)]
+    #[arg(Int)]
+    #[returns(Str, result)]
+    pub search: fn(&Self, String, i32) -> Result<String, ()>,
+
+    #[add_in_func(name = "Add", name_ru = "Добавить")]
+    #[arg(Str)]
+    #[arg(Str)]
+    #[returns(Int, result)]
+    pub add: fn(&mut Self, String, String) -> Result<i32, ()>,
+
+    #[add_in_func(name = "Remove", name_ru = "Удалить")]
+    #[arg(Str)]
+    #[returns(Int, result)]
+    pub remove: fn(&mut Self, String) -> Result<i32, ()>,
+
+    #[add_in_func(name = "Count", name_ru = "Количество")]
+    #[returns(Int, result)]
+    pub count: fn(&Self) -> Result<i32, ()>,
+}
+
+impl NativeApiSearch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for NativeApiSearch {
+    fn default() -> Self {
+        Self {
+            connection: Arc::new(None),
+            collection_json: String::new(),
+            engine: Arc::new(Mutex::new(SearchEngine::default())),
+            hello_world: Self::hello_world_inner,
+            build_index: Self::build_index_inner,
+            search: Self::search_inner,
+            add: Self::add_inner,
+            remove: Self::remove_inner,
+            count: Self::count_inner,
+        }
+    }
+}
+
+impl NativeApiSearch {
+    fn hello_world_inner(&self) -> Result<String, ()> {
+        Ok("Hello World from Rust!".to_string())
+    }
+
+    fn build_index_inner(&mut self) -> Result<i32, ()> {
+        let docs: Vec<serde_json::Value> = match serde_json::from_str(&self.collection_json) {
+            Ok(d) => d,
+            Err(_) => return Ok(-1),
+        };
+
+        let mut engine = match self.engine.lock() {
+            Ok(e) => e,
+            Err(_) => return Ok(-2),
+        };
+
+        match engine.build_index_from_docs(&docs) {
+            Ok(count) => Ok(count as i32),
+            Err(_) => Ok(-3),
+        }
+    }
+
+    fn search_inner(&self, query: String, limit: i32) -> Result<String, ()> {
+        if query.trim().is_empty() {
+            return Ok("[]".to_string());
+        }
+
+        let safe_limit = if limit > 10 { 10 } else { limit };
+        if safe_limit <= 0 {
+            return Ok("[]".to_string());
+        }
+
+        let engine = match self.engine.lock() {
+            Ok(e) => e,
+            Err(_) => return Ok("[]".to_string()),
+        };
+
+        match engine.search(&query, safe_limit as usize) {
+            Ok(result) => Ok(result),
+            Err(_) => Ok("[]".to_string()),
+        }
+    }
+
+    fn add_inner(&mut self, id: String, text: String) -> Result<i32, ()> {
+        let mut engine = match self.engine.lock() {
+            Ok(e) => e,
+            Err(_) => return Ok(0),
+        };
+
+        let index = match engine.index.as_ref() {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+        let id_field = match engine.id_field {
+            Some(f) => f,
+            None => return Ok(0),
+        };
+        let text_field = match engine.text_field {
+            Some(f) => f,
+            None => return Ok(0),
+        };
+
+        let mut writer = match index.writer(50_000_000) {
+            Ok(w) => w,
+            Err(_) => return Ok(0),
+        };
+
+        if let Err(_) = writer.add_document(doc!(
+            id_field => id,
+            text_field => text
+        )) {
+            return Ok(0);
+        }
+
+        if let Err(_) = writer.commit() {
+            return Ok(0);
+        }
+        drop(writer);
+
+        engine.total += 1;
+        Ok(1)
+    }
+
+    fn remove_inner(&mut self, id: String) -> Result<i32, ()> {
+        let mut engine = match self.engine.lock() {
+            Ok(e) => e,
+            Err(_) => return Ok(0),
+        };
+
+        let index = match engine.index.as_ref() {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+        let id_field = match engine.id_field {
+            Some(f) => f,
+            None => return Ok(0),
+        };
+
+        let mut writer = match index.writer(50_000_000) {
+            Ok(w) => w,
+            Err(_) => return Ok(0),
+        };
+
+        let term = tantivy::Term::from_field_text(id_field, &id);
+        writer.delete_term(term);
+        if let Err(_) = writer.commit() {
+            return Ok(0);
+        }
+        drop(writer);
+
+        engine.total = engine.total.saturating_sub(1);
+        Ok(1)
+    }
+
+    fn count_inner(&self) -> Result<i32, ()> {
+        match self.engine.lock() {
+            Ok(engine) => Ok(engine.total as i32),
+            Err(_) => Ok(0),
+        }
+    }
+}
