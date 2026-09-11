@@ -9,7 +9,7 @@ use tantivy::{
     collector::TopDocs,
     doc,
     query::QueryParser,
-    schema::{Field, Schema, STORED, TEXT},
+    schema::{Field, Schema, STRING, STORED, TEXT},
     Index,
 };
 
@@ -18,7 +18,8 @@ use tantivy::{
 // ============================================
 struct SearchEngine {
     index: Option<Index>,
-    text_field: Option<Field>,
+    text_field: Option<Field>,      // токенизированное поле для поиска
+    text_raw_field: Option<Field>,  // raw-поле для возврата оригинала
     id_field: Option<Field>,
     total: usize,
 }
@@ -28,6 +29,7 @@ impl Default for SearchEngine {
         Self {
             index: None,
             text_field: None,
+            text_raw_field: None,
             id_field: None,
             total: 0,
         }
@@ -39,6 +41,7 @@ impl SearchEngine {
         let result = (|| -> Result<String, Box<dyn std::error::Error>> {
             let index = self.index.as_ref().ok_or("Индекс не построен")?;
             let text_field = self.text_field.unwrap();
+            let text_raw_field = self.text_raw_field.unwrap();
             let id_field = self.id_field.unwrap();
 
             let reader = index.reader()?;
@@ -53,9 +56,23 @@ impl SearchEngine {
             for (score, addr) in top {
                 let document = searcher.doc(addr)?;
 
+                let id_value = document
+                    .get_first(id_field)
+                    .and_then(|v| v.as_text())
+                    .unwrap_or("")
+                    .to_string();
+
+                // Оригинальный текст берём из raw-поля (STRING | STORED),
+                // для которого as_text() гарантированно работает
+                let text_value = document
+                    .get_first(text_raw_field)
+                    .and_then(|v| v.as_text())
+                    .unwrap_or("")
+                    .to_string();
+
                 hits.push(serde_json::json!({
-                    "id": document.get_first(id_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
-                    "text": document.get_first(text_field).map(|v| v.as_text().unwrap_or("")).unwrap_or(""),
+                    "id": id_value,
+                    "text": text_value,
                     "score": score,
                 }));
             }
@@ -72,8 +89,11 @@ impl SearchEngine {
     fn build_index_from_docs(&mut self, docs: &[serde_json::Value]) -> Result<usize, String> {
         let result = (|| -> Result<usize, Box<dyn std::error::Error>> {
             let mut schema_builder = Schema::builder();
-            let id_field = schema_builder.add_text_field("id", STORED);
-            let text_field = schema_builder.add_text_field("text",  TEXT | STORED);
+            let id_field = schema_builder.add_text_field("id", STRING | STORED);
+            // Токенизированное поле — по нему ищем
+            let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+            // Raw-поле — из него возвращаем оригинал без токенизации
+            let text_raw_field = schema_builder.add_text_field("text_raw", STRING | STORED);
             let schema = schema_builder.build();
 
             let index = Index::create_in_ram(schema);
@@ -84,7 +104,8 @@ impl SearchEngine {
                 let text = d.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 writer.add_document(doc!(
                     id_field => id.to_string(),
-                    text_field => text.to_string()
+                    text_field => text.to_string(),
+                    text_raw_field => text.to_string()
                 ))?;
             }
 
@@ -93,6 +114,7 @@ impl SearchEngine {
 
             self.index = Some(index);
             self.text_field = Some(text_field);
+            self.text_raw_field = Some(text_raw_field);
             self.id_field = Some(id_field);
             self.total = docs.len();
 
@@ -232,6 +254,10 @@ impl NativeApiSearch {
             Some(f) => f,
             None => return Ok(0),
         };
+        let text_raw_field = match engine.text_raw_field {
+            Some(f) => f,
+            None => return Ok(0),
+        };
 
         let mut writer = match index.writer(50_000_000) {
             Ok(w) => w,
@@ -240,7 +266,8 @@ impl NativeApiSearch {
 
         if let Err(_) = writer.add_document(doc!(
             id_field => id,
-            text_field => text
+            text_field => text.clone(),
+            text_raw_field => text
         )) {
             return Ok(0);
         }
