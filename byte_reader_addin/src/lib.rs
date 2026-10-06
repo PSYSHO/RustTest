@@ -40,9 +40,9 @@ impl SearchEngine {
     fn search(&self, query: &str, limit: usize) -> Result<String, String> {
         let result = (|| -> Result<String, Box<dyn std::error::Error>> {
             let index = self.index.as_ref().ok_or("Индекс не построен")?;
-            let text_field = self.text_field.unwrap();
-            let text_raw_field = self.text_raw_field.unwrap();
-            let id_field = self.id_field.unwrap();
+            let text_field = self.text_field.ok_or("Индекс не построен")?;
+            let text_raw_field = self.text_raw_field.ok_or("Индекс не построен")?;
+            let id_field = self.id_field.ok_or("Индекс не построен")?;
 
             let reader = index.reader()?;
             let searcher = reader.searcher();
@@ -110,7 +110,15 @@ impl SearchEngine {
             }
 
             writer.commit()?;
-            drop(writer);
+            // commit() возвращается сразу после записи сегментов, но tantivy
+            // продолжает мёрж/компактацию в фоновых потоках. Если следующий
+            // вызов (Search) прилетает почти мгновенно после BuildIndex, он
+            // может пересечься с этими потоками на общей in-RAM директории —
+            // гонка, которая непредсказуемо портит память (отсюда падения
+            // 1CV8.exe, которые исчезают под отладчиком: пауза на точке
+            // останова просто даёт фоновым потокам время завершиться).
+            // wait_merging_threads() блокируется до их полного завершения.
+            writer.wait_merging_threads()?;
 
             self.index = Some(index);
             self.text_field = Some(text_field);
@@ -151,7 +159,7 @@ pub struct NativeApiSearch {
 
     #[add_in_func(name = "Search", name_ru = "Поиск")]
     #[arg(Str)]
-    #[arg(Int, default = 100)]
+    #[arg(Int, default = 20)]
     #[returns(Str, result)]
     pub search: fn(&Self, String, i32) -> Result<String, ()>,
 
@@ -193,75 +201,97 @@ impl Default for NativeApiSearch {
     }
 }
 
+// Границы FFI, которые генерирует native_api_1c для вызовов из 1С, не
+// рассчитаны на прохождение через них паники Rust: `panic=unwind`
+// разворачивает стек через чужой (1С-шный) SEH-фрейм, что на 32-битной
+// платформе приводит к повреждению цепочки обработчиков исключений и
+// падению 1CV8.exe (STATUS_INVALID_EXCEPTION_HANDLER / ACCESS_VIOLATION)
+// вместо управляемой ошибки. Поэтому каждый метод, вызываемый из 1С,
+// ловит панику на границе и возвращает безопасное значение по умолчанию.
+fn catch<T>(default: T, f: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(default)
+}
+
 impl NativeApiSearch {
     fn hello_world_inner(&self) -> Result<String, ()> {
         Ok("Hello World from Rust!".to_string())
     }
 
     fn build_index_inner(&mut self) -> Result<i32, ()> {
-        let docs: Vec<serde_json::Value> = match serde_json::from_str(&self.collection_json) {
-            Ok(d) => d,
-            Err(_) => return Ok(-1),
-        };
+        Ok(catch(-4, || {
+            let docs: Vec<serde_json::Value> = match serde_json::from_str(&self.collection_json) {
+                Ok(d) => d,
+                Err(_) => return -1,
+            };
 
-        let mut engine = match self.engine.lock() {
-            Ok(e) => e,
-            Err(_) => return Ok(-2),
-        };
+            let mut engine = match self.engine.lock() {
+                Ok(e) => e,
+                Err(_) => return -2,
+            };
 
-        match engine.build_index_from_docs(&docs) {
-            Ok(count) => Ok(count as i32),
-            Err(_) => Ok(-3),
-        }
+            match engine.build_index_from_docs(&docs) {
+                Ok(count) => count as i32,
+                Err(_) => -3,
+            }
+        }))
     }
 
     fn search_inner(&self, query: String, limit: i32) -> Result<String, ()> {
-        if query.trim().is_empty() {
-            return Ok("[]".to_string());
-        }
+        Ok(catch("[]".to_string(), || {
+            if query.trim().is_empty() {
+                return "[]".to_string();
+            }
 
-        let safe_limit = if limit > 10 { 10 } else { limit };
-        if safe_limit <= 0 {
-            return Ok("[]".to_string());
-        }
+            if limit <= 0 {
+                return "[]".to_string();
+            }
+            // Верхняя граница защищает от чрезмерного выделения памяти в
+            // коллекторе tantivy, если из 1С случайно передадут огромный
+            // лимит; в остальном значение полностью управляется параметром.
+            let safe_limit = (limit as usize).min(10_000);
 
-        let engine = match self.engine.lock() {
-            Ok(e) => e,
-            Err(_) => return Ok("[]".to_string()),
-        };
+            let engine = match self.engine.lock() {
+                Ok(e) => e,
+                Err(_) => return "[]".to_string(),
+            };
 
-        match engine.search(&query, safe_limit as usize) {
-            Ok(result) => Ok(result),
-            Err(_) => Ok("[]".to_string()),
-        }
+            match engine.search(&query, safe_limit) {
+                Ok(result) => result,
+                Err(_) => "[]".to_string(),
+            }
+        }))
     }
 
     fn add_inner(&mut self, id: String, text: String) -> Result<i32, ()> {
+        Ok(catch(0, || self.add_inner_impl(id, text)))
+    }
+
+    fn add_inner_impl(&mut self, id: String, text: String) -> i32 {
         let mut engine = match self.engine.lock() {
             Ok(e) => e,
-            Err(_) => return Ok(0),
+            Err(_) => return 0,
         };
 
         let index = match engine.index.as_ref() {
             Some(i) => i,
-            None => return Ok(0),
+            None => return 0,
         };
         let id_field = match engine.id_field {
             Some(f) => f,
-            None => return Ok(0),
+            None => return 0,
         };
         let text_field = match engine.text_field {
             Some(f) => f,
-            None => return Ok(0),
+            None => return 0,
         };
         let text_raw_field = match engine.text_raw_field {
             Some(f) => f,
-            None => return Ok(0),
+            None => return 0,
         };
 
         let mut writer = match index.writer(50_000_000) {
             Ok(w) => w,
-            Err(_) => return Ok(0),
+            Err(_) => return 0,
         };
 
         if let Err(_) = writer.add_document(doc!(
@@ -269,47 +299,55 @@ impl NativeApiSearch {
             text_field => text.clone(),
             text_raw_field => text
         )) {
-            return Ok(0);
+            return 0;
         }
 
         if let Err(_) = writer.commit() {
-            return Ok(0);
+            return 0;
         }
-        drop(writer);
+        if let Err(_) = writer.wait_merging_threads() {
+            return 0;
+        }
 
         engine.total += 1;
-        Ok(1)
+        1
     }
 
     fn remove_inner(&mut self, id: String) -> Result<i32, ()> {
+        Ok(catch(0, || self.remove_inner_impl(id)))
+    }
+
+    fn remove_inner_impl(&mut self, id: String) -> i32 {
         let mut engine = match self.engine.lock() {
             Ok(e) => e,
-            Err(_) => return Ok(0),
+            Err(_) => return 0,
         };
 
         let index = match engine.index.as_ref() {
             Some(i) => i,
-            None => return Ok(0),
+            None => return 0,
         };
         let id_field = match engine.id_field {
             Some(f) => f,
-            None => return Ok(0),
+            None => return 0,
         };
 
         let mut writer = match index.writer(50_000_000) {
             Ok(w) => w,
-            Err(_) => return Ok(0),
+            Err(_) => return 0,
         };
 
         let term = tantivy::Term::from_field_text(id_field, &id);
         writer.delete_term(term);
         if let Err(_) = writer.commit() {
-            return Ok(0);
+            return 0;
         }
-        drop(writer);
+        if let Err(_) = writer.wait_merging_threads() {
+            return 0;
+        }
 
         engine.total = engine.total.saturating_sub(1);
-        Ok(1)
+        1
     }
 
     fn count_inner(&self) -> Result<i32, ()> {
